@@ -1,0 +1,256 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from torchvision.transforms import v2 as transforms
+from transformers import CLIPProcessor, CLIPModel
+from adabelief_pytorch import AdaBelief
+from torch.optim.lr_scheduler import OneCycleLR
+import h5py
+from PIL import Image
+import copy
+
+
+class CLIPDataset(Dataset):
+    """Custom dataset for CLIP training with HDF5 storage and text processing.
+    
+    Args:
+        hdf5_path (str): Path to HDF5 file containing dataset
+        processor (CLIPProcessor): Preprocessor for CLIP model
+        transform (callable, optional): Image augmentations for training
+    """
+    
+    def __init__(self, hdf5_path: str, processor: CLIPProcessor, transform: transforms.Compose = None):
+        self.hdf5_file = h5py.File(hdf5_path, 'r')
+        self.processor = processor
+        self.transform = transform
+        self.images = self.hdf5_file['input_image']
+        self.texts = self.hdf5_file['input_description']
+
+    def __getitem__(self, index: int) -> tuple:
+        """Load and process single image-text pair."""
+        # Process image
+        img_array = self.images[index]
+        image = Image.fromarray(img_array, mode='RGB')
+        if self.transform:
+            image = self.transform(image)
+            
+        # Process text
+        text_bytes = self.texts[index]
+        text = text_bytes.item().decode('latin-1', errors='replace')
+        
+        return image, text
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __del__(self):
+        """Ensure proper HDF5 file closure."""
+        self.hdf5_file.close()
+
+
+def create_transforms() -> transforms.Compose:
+    """Create image augmentation pipeline."""
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ToDtype(torch.float32, scale=True)
+    ])
+
+
+def create_collate_fn(processor: CLIPProcessor):
+    """Factory function to create processor-aware collate function."""
+    def collate_batch(batch: list) -> dict:
+        """Process batch through CLIP processor."""
+        images, texts = zip(*batch)
+        return processor(
+            images=list(images),
+            text=list(texts),
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        )
+    return collate_batch
+
+
+class CLIPTrainer:
+    """Manager class for CLIP model training process."""
+    
+    def __init__(self, model: CLIPModel, optimizer: AdaBelief, scheduler: OneCycleLR, device: torch.device):
+        self.model = model.to(device)
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.scaler = GradScaler()
+        self.best_weights = None
+        self.best_loss = float('inf')
+
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """Execute single training epoch."""
+        self.model.train()
+        total_loss = 0.0
+        
+        for batch_idx, batch in enumerate(train_loader):
+            # Move data to device
+            batch = {k: v.to(self.device) for k, v in batch.items()}
+            
+            # Forward pass with mixed precision
+            self.optimizer.zero_grad()
+            with autocast():
+                outputs = self.model(**batch, return_loss=True)
+                loss = outputs.loss
+                total_loss += loss.item()
+
+            # Backward pass with gradient scaling
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.scheduler.step()
+
+            # Progress reporting
+            if batch_idx % 50 == 0:
+                samples_processed = batch_idx * train_loader.batch_size
+                print(f"Processed {samples_processed}/{len(train_loader.dataset)} samples")
+
+        return total_loss / len(train_loader)
+
+    def validate(self, val_loader: DataLoader) -> float:
+        """Evaluate model on validation set."""
+        self.model.eval()
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+                outputs = self.model(**batch, return_loss=True)
+                total_loss += outputs.loss.item()
+                
+        return total_loss / len(val_loader)
+
+    def train(self, train_loader: DataLoader, val_loader: DataLoader, 
+             num_epochs: int = 40, patience: int = 10) -> dict:
+        """Full training loop with early stopping."""
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            
+            # Training phase
+            train_loss = self.train_epoch(train_loader)
+            print(f"Train Loss: {train_loss:.4f}")
+            
+            # Validation phase
+            val_loss = self.validate(val_loader)
+            print(f"Validation Loss: {val_loss:.4f}")
+            
+            # Checkpoint logic
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.best_weights = copy.deepcopy(self.model.state_dict())
+                patience_counter = patience  # Reset counter
+            else:
+                patience_counter -= 1
+
+            # Periodic checkpointing
+            if (epoch + 1) % 5 == 0:
+                self._save_checkpoint(epoch+1)
+            
+            # Early stopping
+            if patience_counter <= 0:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+
+        return self.best_weights
+
+    def _save_checkpoint(self, epoch: int):
+        """Save model checkpoint with metadata."""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state': self.model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scheduler_state': self.scheduler.state_dict(),
+            'best_loss': self.best_loss
+        }
+        torch.save(checkpoint, f"clip_epoch_{epoch}.pth")
+
+
+def configure_optimization(model: CLIPModel, train_loader: DataLoader, num_epochs: int) -> tuple:
+    """Configure optimizer and scheduler with differential learning rates."""
+    # Parameter grouping
+    vision_params = list(model.vision_model.parameters())
+    text_params = list(model.text_model.parameters())
+    
+    param_groups = [
+        {'params': text_params[:len(text_params)//2], 'lr': 1e-7},
+        {'params': text_params[len(text_params)//2:], 'lr': 3e-7},
+        {'params': vision_params[:len(vision_params)//2], 'lr': 1e-7},
+        {'params': vision_params[len(vision_params)//2:], 'lr': 3e-7},
+    ]
+
+    # Optimizer configuration
+    optimizer = AdaBelief(
+        param_groups,
+        eps=1e-16,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
+        weight_decouple=False,
+        rectify=True
+    )
+
+    # Learning rate scheduler
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=[1e-7, 3e-7, 1e-7, 3e-7],
+        total_steps=num_epochs * len(train_loader),
+        pct_start=0.1,
+        anneal_strategy='cos'
+    )
+
+    return optimizer, scheduler
+
+
+if __name__ == "__main__":
+    # Runtime configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = 320
+    num_epochs = 40
+
+    # Initialize model components
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+    collate_fn = create_collate_fn(processor)
+
+    # Dataset preparation
+    train_data = CLIPDataset(
+        '/gscratch/stf/lbc800/data_CLIP/fashiongen_256_256_train.h5',
+        processor=processor,
+        transform=create_transforms()
+    )
+    val_data = CLIPDataset(
+        '/gscratch/stf/lbc800/data_CLIP/ssense_val.h5',
+        processor=processor
+    )
+
+    # Data loader configuration
+    train_loader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=15,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    val_loader = DataLoader(
+        val_data,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=15,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # Training setup
+    optimizer, scheduler = configure_optimization(model, train_loader, num_epochs)
+    trainer = CLIPTrainer(model, optimizer, scheduler, device)
+    
+    # Execute training
+    final_weights = trainer.train(train_loader, val_loader, num_epochs)
+    torch.save(final_weights, 'clip_model_final.pth')

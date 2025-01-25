@@ -1,0 +1,218 @@
+import torch
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.cuda.amp import autocast, GradScaler
+from torchvision.transforms import v2 as transforms
+from transformers import CLIPProcessor, CLIPModel
+from adabelief_pytorch import AdaBelief
+from torch.optim.lr_scheduler import OneCycleLR
+import h5py
+from PIL import Image
+import numpy as np
+import random
+import copy
+
+
+class CLIPDataset(Dataset):
+    """Custom dataset for CLIP training with HDF5 storage.
+    
+    Args:
+        hdf5_file (str): Path to HDF5 file containing dataset
+        processor (CLIPProcessor): Preprocessor for CLIP model
+        transforms (callable, optional): Optional image augmentations
+    """
+    
+    def __init__(self, hdf5_file, processor, transforms=None):
+        self.hdf5_file = h5py.File(hdf5_file, 'r')
+        self.processor = processor
+        self.transforms = transforms
+        self.images = self.hdf5_file['input_image']
+        self.texts = self.hdf5_file['input_description']
+
+    def __getitem__(self, idx):
+        # Load and process image
+        image = Image.fromarray(self.images[idx], mode='RGB')
+        if self.transforms:
+            image = self.transforms(image)
+
+        # Load and decode text
+        text = self.texts[idx].item().decode('latin-1')
+
+        return image, text
+
+    def __len__(self):
+        return len(self.images)
+
+
+def get_transforms():
+    """Create basic image augmentations for training."""
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(15)
+    ])
+
+
+def collate_fn(batch):
+    """Process batch of images and texts using CLIP processor."""
+    images, texts = zip(*batch)
+    return processor(
+        images=list(images),
+        text=list(texts),
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    )
+
+
+def train_model(model, train_loader, val_loader, optimizer, scheduler, device, num_epochs=40):
+    """Main training loop with early stopping and mixed precision training.
+    
+    Returns:
+        dict: Best model weights based on validation loss
+    """
+    model.to(device)
+    best_loss = float('inf')
+    best_weights = None
+    patience = 10
+    scaler = GradScaler()
+
+    for epoch in range(num_epochs):
+        model.train()
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        
+        # Training phase
+        for i, batch in enumerate(train_loader):
+            if i % 50 == 0:
+                print(f'Processed {i * train_loader.batch_size} samples')
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Forward pass with mixed precision
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(**batch, return_loss=True)
+                loss = outputs.loss
+
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+        # Validation and checkpointing
+        val_loss = validate(model, val_loader, device)
+        
+        # Save best model
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_weights = copy.deepcopy(model.state_dict())
+            patience = 10
+        else:
+            patience -= 1
+
+        # Periodic saving
+        if (epoch + 1) % 5 == 0:
+            torch.save(model.state_dict(), f'clip_model_epoch{epoch+1}.pth')
+            
+        # Early stopping
+        if patience <= 0:
+            print(f'Early stopping at epoch {epoch+1}')
+            break
+
+    return best_weights or model.state_dict()
+
+
+def validate(model, data_loader, device):
+    """Calculate validation loss."""
+    model.eval()
+    total_loss = 0.0
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch, return_loss=True)
+            total_loss += outputs.loss.item()
+
+    avg_loss = total_loss / len(data_loader)
+    print(f'Validation Loss: {avg_loss:.4f}')
+    return avg_loss
+
+
+if __name__ == "__main__":
+    # Configuration
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_size = 320
+    num_epochs = 40
+
+    # Initialize model and processor first
+    model_id = "openai/clip-vit-base-patch16"
+    model = CLIPModel.from_pretrained(model_id)
+    processor = CLIPProcessor.from_pretrained(model_id)
+
+    # Create datasets with transforms
+    train_transforms = get_transforms()
+    train_dataset = CLIPDataset(
+        '/gscratch/stf/lbc800/data_CLIP/fashiongen_256_256_train.h5',
+        processor=processor,
+        transforms=train_transforms
+    )
+    val_dataset = CLIPDataset(
+        '/gscratch/stf/lbc800/data_CLIP/ssense_val.h5',
+        processor=processor
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=15,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=15,
+        pin_memory=True
+    )
+
+    # Parameter groups with differential learning rates
+    visual_params = [p for p in model.vision_model.parameters() if p.requires_grad]
+    text_params = [p for p in model.text_model.parameters() if p.requires_grad]
+    
+    param_groups = [
+        {'params': text_params[:len(text_params)//2], 'lr': 1e-7},
+        {'params': text_params[len(text_params)//2:], 'lr': 3e-7},
+        {'params': visual_params[:len(visual_params)//2], 'lr': 1e-7},
+        {'params': visual_params[len(visual_params)//2:], 'lr': 3e-7},
+    ]
+
+    # Optimizer and scheduler
+    optimizer = AdaBelief(
+        param_groups,
+        eps=1e-16,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
+        weight_decouple=False,
+        rectify=True
+    )
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=[1e-7, 3e-7, 1e-7, 3e-7],
+        total_steps=num_epochs * len(train_loader),
+        pct_start=0.1,
+        anneal_strategy='cos'
+    )
+
+    # Train and save final model
+    best_weights = train_model(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        scheduler,
+        device,
+        num_epochs=num_epochs
+    )
+    torch.save(best_weights, 'clip_model_final.pth')
